@@ -1,0 +1,24 @@
+# Python virtual environment
+.venv/
+
+# Cloned upstream repo (facebookresearch/sam3) - not our code.
+# See MEMORY.md / README.md for the exact clone command + commit hash
+# used this session; re-clone instead of committing Meta's source tree.
+sam3/
+
+# Local Claude Code tool config (machine-specific paths, not project data)
+.claude/
+
+# Python cache / bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Hugging Face / torch caches if ever pointed into the repo
+.cache/
+*.pt
+*.pth
+
+# OS cruft
+.DS_Store
+Thumbs.db

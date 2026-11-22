@@ -200,3 +200,182 @@ Rerun once approved: `.venv/Scripts/python.exe scripts/smoke_test.py --mode eage
 6. `env_freeze.txt` at project root has the exact pinned versions from
    this session (torch, torchvision, triton-windows, numpy, pandas, sam3,
    etc.) — use it to recreate the environment if `.venv` is ever rebuilt.
+
+## Session 2026-11-22: HF access cleared, both smoke-test modes run
+
+### Goal
+Resume from the HF-approval blocker: confirm `facebook/sam3` access,
+rerun `scripts/smoke_test.py --mode eager` to get a real end-to-end
+result, then do the step-5 compile-mode feasibility check (success /
+timeout / fallback / OOM only — no perf trial yet).
+
+### State: both modes run; eager fully succeeded, compile hit mid-run
+recompilation stalls and timed out at 600s (not OOM, not a crash)
+
+**What's done:**
+- Confirmed HF access approved: `hf_hub_download(repo_id="facebook/sam3",
+  filename="sam3.pt")` succeeded directly (previously hit the 403
+  "authenticated but not in the authorized list" error from last
+  session). Checkpoint now cached at
+  `~/.cache/huggingface/hub/models--facebook--sam3/snapshots/<hash>/sam3.pt`
+  (~4.3GB blob). `hf auth whoami` still reports `EllieJean`, unchanged.
+- **Eager mode: full success.** `scripts/smoke_test.py --mode eager`
+  ran the complete pipeline — model build (~13s), 270-frame load (~7s),
+  `add_prompt(text="person")` on frame 0 detected 4 objects, full
+  270-frame `propagate_in_video` in 125.96s (~2.14 fps throughput over
+  the whole loop), peak CUDA memory 10333.5 MiB (well inside the 12GB
+  4070 SUPER budget, ~1.9GB headroom), first nonempty mask at frame 0
+  with shape `(4, 720, 1280)` and 220552 nonzero pixels across 4 objects.
+  Overlay PNG written to `outputs/smoke_test_eager_overlay.png` (966KB) —
+  **this is a real result, not a stub**, confirming the whole pipeline
+  (checkpoint load → text prompt → video tracker → mask decode →
+  visualization) works on this hardware.
+- **Compile mode: feasibility check completed, hit TimeoutError (not
+  OOM/crash) at 600s.** `scripts/smoke_test.py --mode compile --timeout
+  600` ran: model build, frame load, `add_prompt` (4 objects, same as
+  eager — compile doesn't touch the first prompt call, consistent with
+  the `_compile_model()` trace from last session: it's invoked inside
+  `propagate_in_video`, not `add_prompt`), then propagation. Early
+  frames progressed at ~3.1 it/s (comparable/faster than eager's ~2.4
+  it/s steady-state) once warmed up, but **around frame 172-173 new
+  Inductor `AUTOTUNE addmm(...)` events fired for previously-unseen
+  tensor shapes** (seen in log: shapes shifted from `8x256`/`8x128`
+  early on to `5184x...`/`5188x...` later — consistent with object
+  count or sequence-length changes triggering fresh kernel search),
+  each costing several seconds of wall-clock (one gap recorded at
+  ~9.36s for a single frame, another ~3.85s/it) before the 600s ceiling
+  was hit at 159 frames counted (progress bar showed up to 172/270 by
+  then, since the timeout check and the tqdm counter aren't perfectly
+  synced). **GPU memory returned to baseline (~1.16GB used, same as
+  idle) after the run** — confirms this is a genuine recompilation/
+  retuning stall, not a memory crash or leak.
+- **What this means for later work:** this is exactly the kind of
+  "silent recompile" case flagged in last session's trace notes
+  (`_compile_model()` sets `suppress_errors=True`). The mid-video
+  AUTOTUNE events are *not* silent (they print), but they **do** show
+  that `max-autotune` is re-tuning kernels well after the documented
+  frame-0 warmup, i.e. warmup via the first `add_prompt` call is
+  insufficient to avoid serve-time recompilation when object count /
+  internal tensor shapes change over the course of a video. This is a
+  concrete, measured instance of exactly the risk the project's planned
+  three-way eager/backbone-only/stock-compile comparison needs to
+  quantify — worth rerunning with `TORCH_LOGS=recompiles` (per last
+  session's note on `scripts/bench_compile.py:136`) to get an exact
+  recompile count/cause rather than inferring from AUTOTUNE shape
+  changes.
+- Verified `outputs/` and `.gitignore` still correct; only the eager
+  overlay PNG is on disk (compile mode's TimeoutError path in
+  `smoke_test.py` doesn't reach the `save_masklet_image` call, so no
+  compile-mode overlay exists yet — not a bug, just that path requires a
+  full completion).
+
+### Design decisions
+- Used `--timeout 600` for the compile feasibility check rather than
+  letting it run to completion — per the plan's step 5 scope ("success/
+  timeout/fallback/OOM only, don't do full perf trials yet"). 600s was
+  picked as roughly 5x eager's full-video time (126s), generous enough
+  to absorb expected compile warmup/autotune overhead while still
+  bounding runtime for a feasibility check.
+- Did not rerun compile mode with a longer timeout or investigate the
+  recompile trigger further this session — that belongs to the later
+  dedicated compile-mode comparison work, not this checkpoint-unblocking
+  session.
+
+### Open questions for next time
+1. **Main unblocked next step**: build the actual 3-way comparison
+   harness (eager / backbone-only compile / stock compile) using
+   `scripts/bench_compile.py` and `scripts/measure_speed.py` as
+   templates, per last session's trace of the compile entry points.
+   Both eager and compile-mode feasibility are now confirmed to run on
+   this hardware, so there's no remaining blocker to starting this.
+2. Should the comparison harness run with `TORCH_LOGS=recompiles` (or
+   `torch._dynamo.config.suppress_errors=False`) by default, given that
+   this session caught a real mid-video recompile stall under default
+   settings? Leaning yes — the stall found this session suggests
+   recompile visibility should be on by default for the comparison, not
+   opt-in.
+3. For the backbone-only compile patch, still need to decide between
+   route (a) (thread `compile_mode` into `build_sam3_video_model`'s ViT)
+   vs route (b) (`compile_visual=True` on `SAM3VLBackbone`) — unchanged
+   from last session, not yet investigated further.
+4. Should still read `scripts/measure_speed.py` before building the
+   3-way harness — not yet read as of this session either.
+5. Given the mid-video recompile stall observed here, worth deciding
+   whether the comparison should track "time to Nth frame" curves
+   (to show the stall shape) rather than just total elapsed time /
+   average fps, since a single aggregate number would hide this effect.
+6. 12GB VRAM headroom looks comfortable for eager (10.3GB peak, ~1.9GB
+   free) but compile mode's peak was never measured this session (the
+   TimeoutError path exits before reaching the peak-memory print) —
+   worth checking compile-mode peak memory specifically once the
+   recompile-stall question above is resolved, since `max-autotune`
+   kernel search can transiently use extra memory during autotuning.
+
+### Addendum: formal proposal now exists, supersedes some open questions above
+`CS_587_Final_Project_Proposal.pdf` (added to repo root 2026-11-22, author
+Ellie Larence, title "Selective Compilation for SAM 3 Video Inference")
+locks in scope, hypothesis, and schedule. It directly cites this
+session's own numbers (125.96s eager full-propagation time, 600s compile
+timeout), so project plan and this session's empirical results are
+already in sync. Key takeaways for future sessions:
+
+- **Research question**: does compiling only SAM3's vision backbone beat
+  Meta's stock (full) compile policy on total time-to-mask for a fixed
+  270-frame/1280x720 clip prompted with "person"?
+- **Hypothesis (two-part, both must hold)**: (1) cold-process,
+  empty-Inductor-cache backbone-only run beats stock-compile's
+  launch-to-final-mask time by >=20% on the 270-frame clip; (2) in a
+  second, same-process warm session (predictor/compiled code already
+  loaded), backbone-only retains >=90% of stock's warmed propagation FPS.
+- **Chosen patch approach resolves last session's open route (a) vs (b)
+  question — it's actually a third, simpler route (c)**: add a
+  backbone-only option directly at the existing `_compile_model()` entry
+  point (`sam3/model/sam3_video_inference.py:573-651`), reusing the same
+  wrapper/compiler settings already used there for the backbone line
+  (line 595) but skipping the calls that compile the transformer
+  encoder/decoder, segmentation head, and tracker submodules. This is
+  neither route (a) (threading `compile_mode` through
+  `build_sam3_video_model`'s ViT builder chain) nor route (b)
+  (`compile_visual=True` on `SAM3VLBackbone`) from the 2026-11-20 trace
+  notes — **go with this `_compile_model()`-level flag instead**, it's
+  the proposal's committed design.
+- **Evaluation plan specifics**: 5 trials per mode (eager / backbone-only
+  / stock), alternating order; each cold trial = fresh process + empty
+  TorchInductor cache; after cold run, open a fresh video session in the
+  *same* process to measure warmed propagation FPS with compiled code
+  already resident. Diagnostic runs use `TORCH_LOGS=recompiles` to
+  distinguish real guard-failure recompiles from Inductor autotuning
+  events (both were conflated by inference in this session's log —
+  needs the env var to pin down for real). Common timeout set before
+  formal trials; incomplete runs reported with last completed frame;
+  compare frame coverage, unmatched object IDs, and mask IoU against
+  eager output per trial so a timed-out/degraded run can't be
+  miscounted as a speedup. Two measured variables: (1) process-launch to
+  final-mask wall time, (2) warmed propagation FPS.
+- **Also run a short-prefix workload** (subset of the 270 frames) to see
+  how the comparison shifts when there's less video to amortize compile
+  cost — not just the full clip.
+- **Schedule** (from proposal, all dates 2026): Nov 22-26 implement the
+  backbone-only `_compile_model()` patch + per-frame timing/timeout
+  logging, verify mask agreement (vs eager) on a short clip; Nov 27-30
+  run all three modes on the short clip, confirm which functions
+  actually compiled (via logs/`TORCH_LOGS`), submit status update; Dec
+  1-5 run the full repeated-trial comparison, produce the elapsed-time
+  figure + peak-VRAM table; Dec 6-11 analyze completed runs/timeouts,
+  document rerun steps, write final report. **We are at the very start
+  of the Nov 22-26 window as of this session** — the literal next task
+  is implementing the `_compile_model()` backbone-only flag, not yet
+  started.
+- **Fallback already specified** if stock compile can't be made to
+  finish even with a longer timeout: narrow to eager-vs-backbone-only
+  only, on the short-prefix workload, to test whether selective
+  compilation at least repays its own startup cost — don't block the
+  whole project on stock compile finishing.
+- AI-workflow section of the proposal explicitly commits to: tracing the
+  predictor and drafting the patch via Claude Code (already underway),
+  reviewing the diff against the stock compile path, checking compiler
+  logs/traces to verify only the intended functions compiled, and
+  comparing resulting masks against eager output before trusting any
+  performance numbers — i.e. mask-correctness checks are a hard
+  prerequisite before reporting any timing result, not an optional
+  nice-to-have.
